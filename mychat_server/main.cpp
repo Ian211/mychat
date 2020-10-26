@@ -18,7 +18,7 @@ struct client
 	char buf[BUF_SIZE];
 };
 int main(int argc, char* argv[]) {
-	if (argc<=2)
+	if (argc <= 2)
 	{
 		printf("usage: %s ip host\n", basename(argv[0]));
 		return 1;
@@ -27,7 +27,7 @@ int main(int argc, char* argv[]) {
 	int port = atoi(argv[2]);
 
 	sockaddr_in	address;
-	bzero(&address,sizeof(address));
+	bzero(&address, sizeof(address));
 	address.sin_family = AF_INET;
 	address.sin_port = htons(port);
 	inet_pton(AF_INET, ip, &address.sin_addr);
@@ -36,15 +36,15 @@ int main(int argc, char* argv[]) {
 	int listenfd = socket(PF_INET, SOCK_STREAM, 0);
 	assert(listen >= 0);
 	ret = bind(listenfd, (sockaddr*)&address, sizeof(address));
-	assert(ret !=-1);
+	assert(ret != -1);
 
-	client* USERS=new client[FD_LIMIT];
+	client* USERS = new client[FD_LIMIT];
 	int user_count = 0;
-	pollfd fds[USER_LIMIT+1];
+	pollfd fds[USER_LIMIT + 1];
 	fds[0].fd = listenfd;
 	fds[0].events = POLLIN | POLLERR;
 	fds[0].revents = 0;
-	for (int i = 1; i < USER_LIMIT+1; i++)
+	for (int i = 1; i < USER_LIMIT + 1; i++)
 	{
 		fds[i].fd = -1;
 		fds[i].events = 0;
@@ -55,60 +55,60 @@ int main(int argc, char* argv[]) {
 	while (1)
 	{
 		ret = poll(fds, USER_LIMIT + 1, -1);
-		if (ret<0)
+		if (ret < 0)
 		{
 			printf("poll failure!\n");
 			break;
 		}
-		else if (ret==0)
+		else if (ret == 0)
 		{
 			continue;
 		}
 		else
 		{
-			for (int i = 0; i < user_count+1; i++)
+			for (int i = 0; i < user_count + 1; i++)
 			{
-				if ((fds[i].fd==listenfd)&&(fds[i].revents&POLLIN))
+				if ((fds[i].fd == listenfd) && (fds[i].revents & POLLIN))
 				{
 					int clientfd;
 					sockaddr_in clientAddr;
 					bzero(&clientAddr, sizeof(clientAddr));
 					socklen_t length = (socklen_t)sizeof(clientAddr);
-					clientfd=accept(listenfd, (sockaddr*)&clientAddr,&length);
-					if (clientfd<0)
+					clientfd = accept(listenfd, (sockaddr*)&clientAddr, &length);
+					if (clientfd < 0)
 					{
 						printf("errno:&d\n", errno);
 						continue;
 					}
-					if (user_count>=USER_LIMIT)
+					if (user_count >= USER_LIMIT)
 					{
-						const char* info = "Sorry,too many users\n"; 
+						const char* info = "Sorry,too many users\n";
 						printf("%s", info);
-						send(clientfd, info, sizeof(info),0);
+						send(clientfd, info, sizeof(info), 0);
 						close(clientfd);
 						continue;
 					}
 					user_count++;
 					USERS[clientfd].address = clientAddr;
-					fds[user_count].fd=clientfd;
+					fds[user_count].fd = clientfd;
 					fds[user_count].events = POLLIN | POLLRDHUP | POLLERR;
 					fds[user_count].revents = 0;
-					printf("comes a new user,now have %d users\n",user_count);
+					printf("comes a new user,now have %d users\n", user_count);
 				}
-				else if (fds[i].revents&POLLERR)
+				else if (fds[i].revents & POLLERR)
 				{
 					printf("get an error from %d\n", fds[i].fd);
 					char errors[100];
 					memset(errors, '\0', sizeof(errors));
 					socklen_t length = sizeof(errors);
-					if (getsockopt(fds[i].fd,SOL_SOCKET,SO_ERROR,&errors,&length)<0)
+					if (getsockopt(fds[i].fd, SOL_SOCKET, SO_ERROR, &errors, &length) < 0)
 					{
-						printf("getsockopt failed,errno:%d\n",errno);
+						printf("getsockopt failed,errno:%d\n", errno);
 					}
 					printf("error:%s\n", errors);
 					continue;
 				}
-				else if (fds[i].revents&POLLRDHUP)
+				else if (fds[i].revents & POLLRDHUP)
 				{
 					USERS[fds[i].fd] = USERS[fds[user_count].fd];
 					printf("user %d left\n", fds[i].fd);
@@ -117,30 +117,30 @@ int main(int argc, char* argv[]) {
 					user_count--;
 					i--;
 				}
-				else if (fds[i].revents&POLLIN)
+				else if (fds[i].revents & POLLIN)
 				{
 					int clientfd = fds[i].fd;
 					memset(USERS[clientfd].buf, '\0', BUF_SIZE);
-					ret=recv(clientfd, USERS[clientfd].buf, BUF_SIZE, 0);
-					if (ret<0)
+					ret = recv(clientfd, USERS[clientfd].buf, BUF_SIZE, 0);
+					if (ret < 0)
 					{
-						if (errno!=EAGAIN)
+						if (errno != EAGAIN)
 						{
 							USERS[fds[i].fd] = USERS[fds[user_count].fd];
-							printf("user %d left for error:%d\n", fds[i].fd,errno);
+							printf("user %d left for error:%d\n", fds[i].fd, errno);
 							close(fds[i].fd);
 							fds[i].fd = fds[user_count].fd;
 							user_count--;
 							i--;
 						}
 					}
-					else if (ret==0)
+					else if (ret == 0)
 					{
 						printf("code should not come to here\n");
 					}
 					else
 					{
-						printf("Get %d bytes from %d: %s ",ret, fds[i].fd, USERS[fds[i].fd].buf);
+						printf("Get %d bytes from %d: %s ", ret, fds[i].fd, USERS[fds[i].fd].buf);
 						for (int j = 1; j < user_count + 1; j++)
 						{
 							if (i == j)
@@ -151,13 +151,13 @@ int main(int argc, char* argv[]) {
 						}
 					}
 				}
-				else if (fds[i].revents&POLLOUT)
+				else if (fds[i].revents & POLLOUT)
 				{
 					if (!USERS[fds[i].fd].write)
 					{
 						continue;
 					}
-					ret=send(fds[i].fd, USERS[fds[i].fd].write, strlen(USERS[fds[i].fd].write),0);
+					ret = send(fds[i].fd, USERS[fds[i].fd].write, strlen(USERS[fds[i].fd].write), 0);
 					if (ret < 0)
 					{
 						if (errno != EAGAIN)

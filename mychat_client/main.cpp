@@ -29,13 +29,13 @@ int main(int argc, char* argv[]) {
 	int ret;
 	int sockfd = socket(PF_INET, SOCK_STREAM, 0);
 	ret = connect(sockfd, (sockaddr*)&address, sizeof(address));
-	if (ret<0)
+	if (ret < 0)
 	{
 		printf("connection failure!errno:%d\n", errno);
 		return 1;
 	}
 	int p[2];
-	ret=pipe(p);
+	ret = pipe(p);
 	assert(ret != -1);
 	pollfd fds[2];
 	fds[0].fd = 0;
@@ -48,23 +48,23 @@ int main(int argc, char* argv[]) {
 	while (1)
 	{
 		ret = poll(fds, 2, -1);
-		if (ret<0)
+		if (ret < 0)
 		{
 			printf("poll failure!\n");
 			break;
 		}
-		if (fds[1].revents&POLLRDHUP)
+		if (fds[1].revents & POLLRDHUP)
 		{
 			printf("connection closed by server!\n");
 			break;
 		}
-		else if(fds[1].revents&POLLIN)
+		else if (fds[1].revents & POLLIN)
 		{
 			memset(msg, '\0', BUF_SIZE);
-			ret = recv(fds[1].fd, msg, BUF_SIZE-1, 0);
-			if (ret<0)
+			ret = recv(fds[1].fd, msg, BUF_SIZE - 1, 0);
+			if (ret < 0)
 			{
-				if (errno!=EAGAIN)
+				if (errno != EAGAIN)
 				{
 					printf("Recv error!\n");
 					continue;
@@ -72,7 +72,7 @@ int main(int argc, char* argv[]) {
 			}
 			printf("%s", msg);
 		}
-		if (fds[0].revents&POLLIN)
+		if (fds[0].revents & POLLIN)
 		{
 			splice(0, NULL, p[1], NULL, 32768, SPLICE_F_MORE);
 			splice(p[0], NULL, sockfd, NULL, 32768, SPLICE_F_MORE);
