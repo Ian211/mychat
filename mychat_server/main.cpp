@@ -1,202 +1,417 @@
-#include <cstdio>
-#include <libgen.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <string.h>
-#include <string>
 #include <arpa/inet.h>
 #include <assert.h>
-#include <poll.h>
+#include <stdio.h>
 #include <unistd.h>
-#define BUF_SIZE 64
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/epoll.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
 #define USER_LIMIT 5
+#define BUFFER_SIZE 1024
 #define FD_LIMIT 65535
-struct client
+#define MAX_EVENT_NUMBER 1024
+#define PROCESS_LIMIT 65536
+//用户数据结构
+struct client_data
 {
-	sockaddr_in address;
-	char* write;
-	char buf[BUF_SIZE];
+    sockaddr_in address;
+    int connfd;
+    pid_t pid;
+    int pipefd[2];//socketpair，用于通知进程有消息需要传输
 };
-//server
-int main(int argc, char* argv[]) {
-	if (argc <= 2)
-	{
-		printf("usage: %s ip host\n", basename(argv[0]));
-		return 1;
-	}
-	const char* ip = argv[1];
-	int port = atoi(argv[2]);
 
-	sockaddr_in	address;
-	bzero(&address, sizeof(address));
-	address.sin_family = AF_INET;
-	address.sin_port = htons(port);
-	inet_pton(AF_INET, ip, &address.sin_addr);
+static const char* shm_name = "/my_shm";
+int sig_pipefd[2];
+int epollfd;
+int listenfd;
+int shmfd;
+char* share_mem = 0;
+client_data* users = 0;
+int* sub_process = 0;
+int user_count = 0;
+bool stop_child = false;
+//设置fd为非阻塞，EPOLL在ET模式下“必须”设置非阻塞
+int setnonblocking(int fd)
+{
+    int old_option = fcntl(fd, F_GETFL);
+    int new_option = old_option | O_NONBLOCK;
+    fcntl(fd, F_SETFL, new_option);
+    return old_option;
+}
+//epoll添加监听fd的包装函数
+void addfd(int epollfd, int fd)
+{
+    epoll_event event;
+    event.data.fd = fd;
+    event.events = EPOLLIN | EPOLLET;
+    epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &event);
+    setnonblocking(fd);
+}
+//信号处理函数：转发到sig_pipefd，由一个进程复制处理所有信号
+void sig_handler(int sig)
+{
+    int save_errno = errno;
+    int msg = sig;
+    send(sig_pipefd[1], (char*)&msg, 1, 0);
+    errno = save_errno;
+}
+//一个信号的处理函数
+void addsig(int sig, void(*handler)(int), bool restart = true)
+{
+    struct sigaction sa;
+    memset(&sa, '\0', sizeof(sa));
+    sa.sa_handler = handler;
+    if (restart)
+    {
+        sa.sa_flags |= SA_RESTART;
+    }
+    sigfillset(&sa.sa_mask);
+    assert(sigaction(sig, &sa, NULL) != -1);
+}
+//释放资源
+void del_resource()
+{
+    close(sig_pipefd[0]);
+    close(sig_pipefd[1]);
+    close(listenfd);
+    close(epollfd);
+    shm_unlink(shm_name);
+    delete[] users;
+    delete[] sub_process;
+}
+//子进程停止信号处理函数
+void child_term_handler(int sig)
+{
+    stop_child = true;
+}
+//一个子进程负责一个用户
+int run_child(int idx, client_data* users, char* share_mem)
+{
+    epoll_event events[MAX_EVENT_NUMBER];
+    int child_epollfd = epoll_create(5);
+    assert(child_epollfd != -1);
+    int connfd = users[idx].connfd;
+    addfd(child_epollfd, connfd);//监听用户的输入
+    int pipefd = users[idx].pipefd[1];
+    addfd(child_epollfd, pipefd);//监听主进程的通知
+    int ret;
+    addsig(SIGTERM, child_term_handler, false);//设置SIGTERM的处理函数
 
-	int ret;
-	int listenfd = socket(PF_INET, SOCK_STREAM, 0);
-	assert(listen >= 0);
-	ret = bind(listenfd, (sockaddr*)&address, sizeof(address));
-	assert(ret != -1);
+    while (!stop_child)
+    {
+        int number = epoll_wait(child_epollfd, events, MAX_EVENT_NUMBER, -1);
+        //epoll出错
+        if ((number < 0) && (errno != EINTR))
+        {
+            printf("epoll failure\n");
+            break;
+        }
 
-	client* USERS = new client[FD_LIMIT];//保存用户数据，可以直接用fd获取对应的用户数据（以空间换时间）
-	int user_count = 0;
-	pollfd fds[USER_LIMIT + 1];//+1是listen fd
-	//添加并设置listen fd
-	fds[0].fd = listenfd;
-	fds[0].events = POLLIN | POLLERR;
-	fds[0].revents = 0;
-	//添加并设置用户socket
-	for (int i = 1; i < USER_LIMIT + 1; i++)
-	{
-		fds[i].fd = -1;
-		fds[i].events = 0;
-		fds[i].revents = 0;
-	}
-	//开始监听listen fd
-	ret = listen(listenfd, 5);
-	assert(ret != -1);
-	while (1)
-	{
-		//返回就绪（可读、可写、异常）的文件描述符的总数，返回-1表示失败并设置了errno
-		ret = poll(fds, USER_LIMIT + 1, -1);
-		if (ret < 0)
-		{
-			printf("poll failure!\n");
-			break;
-		}
-		else if (ret == 0)
-		{
-			continue;
-		}
-		else
-		{
-			//轮询每个文件描述符与事件
-			for (int i = 0; i < user_count + 1; i++)
-			{
-				//监听端口有新的连接
-				if ((fds[i].fd == listenfd) && (fds[i].revents & POLLIN))
-				{
-					//从accept队列中取出一个socket连接
-					int clientfd;
-					sockaddr_in clientAddr;
-					bzero(&clientAddr, sizeof(clientAddr));
-					socklen_t length = (socklen_t)sizeof(clientAddr);
-					clientfd = accept(listenfd, (sockaddr*)&clientAddr, &length);
-					//失败时返回-1并设置errno
-					if (clientfd < 0)
-					{
-						printf("errno:&d\n", errno);
-						continue;
-					}
-					//用户数量超出限制时发送错误信息后关闭连接
-					if (user_count >= USER_LIMIT)
-					{
-						const char* info = "Sorry,too many users\n";
-						printf("%s", info);
-						send(clientfd, info, sizeof(info), 0);
-						close(clientfd);
-						continue;
-					}
-					//新增一个用户
-					user_count++;
-					USERS[clientfd].address = clientAddr;
-					fds[user_count].fd = clientfd;
-					fds[user_count].events = POLLIN | POLLRDHUP | POLLERR;
-					fds[user_count].revents = 0;
-					printf("comes a new user,now have %d users\n", user_count);
-				}
-				//fds[i]发生错误
-				else if (fds[i].revents & POLLERR)
-				{
-					printf("get an error from %d\n", fds[i].fd);
-					char errors[100];
-					memset(errors, '\0', sizeof(errors));
-					socklen_t length = sizeof(errors);
-					//取出对应socket的错误信息并清除错误，失败返回-1
-					if (getsockopt(fds[i].fd, SOL_SOCKET, SO_ERROR, &errors, &length) < 0)
-					{
-						printf("getsockopt failed,errno:%d\n", errno);
-					}
-					printf("error:%s\n", errors);
-					continue;
-				}
-				//客户端断开连接
-				else if (fds[i].revents & POLLRDHUP)
-				{
-					USERS[fds[i].fd] = USERS[fds[user_count].fd];
-					printf("user %d left\n", fds[i].fd);
-					close(fds[i].fd);
-					fds[i].fd = fds[user_count].fd;
-					user_count--;
-					i--;
-				}
-				//客户端发送了信息
-				else if (fds[i].revents & POLLIN)
-				{
-					int clientfd = fds[i].fd;
-					memset(USERS[clientfd].buf, '\0', BUF_SIZE);
-					//接收信息保存到该用户对应的buf
-					ret = recv(clientfd, USERS[clientfd].buf, BUF_SIZE, 0);
-					if (ret < 0)//如果不是EAGAIN错误就关闭该客户端连接
-					{
-						if (errno != EAGAIN)
-						{
-							USERS[fds[i].fd] = USERS[fds[user_count].fd];
-							printf("user %d left for error:%d\n", fds[i].fd, errno);
-							close(fds[i].fd);
-							fds[i].fd = fds[user_count].fd;
-							user_count--;
-							i--;
-						}
-					}
-					else if (ret == 0)
-					{
-						printf("code should not come to here\n");
-					}
-					//设置其它用户的可写事件并设置write指针指向发送消息的用户buf
-					else
-					{
-						printf("Get %d bytes from %d: %s ", ret, fds[i].fd, USERS[fds[i].fd].buf);
-						for (int j = 1; j < user_count + 1; j++)
-						{
-							if (i == j)
-								continue;
-							fds[j].events |= ~POLLIN;
-							fds[j].events |= POLLOUT;
-							USERS[fds[j].fd].write = USERS[fds[i].fd].buf;
-						}
-					}
-				}
-				//挨个发送接收到的信息
-				else if (fds[i].revents & POLLOUT)
-				{
-					if (!USERS[fds[i].fd].write)
-					{
-						continue;
-					}
-					ret = send(fds[i].fd, USERS[fds[i].fd].write, strlen(USERS[fds[i].fd].write), 0);
-					if (ret < 0)
-					{
-						if (errno != EAGAIN)
-						{
-							USERS[fds[i].fd] = USERS[fds[user_count].fd];
-							printf("user %d left for error:%d\n", fds[i].fd, errno);
-							close(fds[i].fd);
-							fds[i].fd = fds[user_count].fd;
-							user_count--;
-							i--;
-						}
-					}
-					//回复events
-					USERS[fds[i].fd].write = NULL;
-					fds[i].events |= POLLIN;
-					fds[i].events |= ~POLLOUT;
-				}
-			}
-		}
-	}
-	delete USERS;
-	close(listenfd);
-	return 0;
+        for (int i = 0; i < number; i++)
+        {
+            int sockfd = events[i].data.fd;
+            //用户发送信息了
+            if ((sockfd == connfd) && (events[i].events & EPOLLIN))
+            {
+                //把信息接收到对应的用户空间
+                memset(share_mem + idx * BUFFER_SIZE, '\0', BUFFER_SIZE);
+                ret = recv(connfd, share_mem + idx * BUFFER_SIZE, BUFFER_SIZE - 1, 0);
+                if (ret < 0)
+                {
+                    if (errno != EAGAIN)
+                    {
+                        stop_child = true;
+                    }
+                }
+                else if (ret == 0)
+                {
+                    stop_child = true;
+                }
+                else
+                {
+                    //通知主进程：本进程负责的用户idx发送了消息
+                    send(pipefd, (char*)&idx, sizeof(idx), 0);
+                }
+            }
+            //主进程有通知：其他用户发送了消息
+            else if ((sockfd == pipefd) && (events[i].events & EPOLLIN))
+            {
+                int client = 0;
+                //看看是哪个用户
+                ret = recv(sockfd, (char*)&client, sizeof(client), 0);
+                if (ret < 0)
+                {
+                    if (errno != EAGAIN)
+                    {
+                        stop_child = true;
+                    }
+                }
+                else if (ret == 0)
+                {
+                    stop_child = true;
+                }
+                else
+                {
+                    //把发送信息的用户client的信息转发到本进程负责的用户
+                    char user_info[BUFFER_SIZE];
+                    sprintf(user_info,"user %d:", client);
+                    send(connfd, user_info, strlen(user_info),0);
+                    send(connfd, share_mem + client * BUFFER_SIZE, BUFFER_SIZE, 0);
+                }
+            }
+            else
+            {
+                continue;
+            }
+        }
+    }
+    //退出
+    close(connfd);
+    close(pipefd);
+    close(child_epollfd);
+    return 0;
+}
+
+int main(int argc, char* argv[])
+{
+    if (argc <= 2)
+    {
+        printf("usage: %s ip_address port_number\n", basename(argv[0]));
+        return 1;
+    }
+    const char* ip = argv[1];
+    int port = atoi(argv[2]);
+
+    int ret = 0;
+    struct sockaddr_in address;
+    bzero(&address, sizeof(address));
+    address.sin_family = AF_INET;
+    inet_pton(AF_INET, ip, &address.sin_addr);
+    address.sin_port = htons(port);
+
+    listenfd = socket(PF_INET, SOCK_STREAM, 0);
+    assert(listenfd >= 0);
+
+    ret = bind(listenfd, (struct sockaddr*)&address, sizeof(address));
+    assert(ret != -1);
+
+    ret = listen(listenfd, 5);
+    assert(ret != -1);
+    //新建用户空间users和子进程空间sub_process
+    user_count = 0;
+    users = new client_data[USER_LIMIT + 1];
+    sub_process = new int[PROCESS_LIMIT];
+    for (int i = 0; i < PROCESS_LIMIT; ++i)
+    {
+        sub_process[i] = -1;
+    }
+
+    epoll_event events[MAX_EVENT_NUMBER];
+    epollfd = epoll_create(5);
+    assert(epollfd != -1);
+    addfd(epollfd, listenfd);//监听listenfd
+
+    //由主进程负责处理各类信号
+    ret = socketpair(PF_UNIX, SOCK_STREAM, 0, sig_pipefd);
+    assert(ret != -1);
+    setnonblocking(sig_pipefd[1]);//困惑：为啥不是sig_pipefd[0]
+    addfd(epollfd, sig_pipefd[0]);
+
+    //在创建子进程前设置好统一的信号处理函数
+    addsig(SIGCHLD, sig_handler);
+    addsig(SIGTERM, sig_handler);
+    addsig(SIGINT, sig_handler);
+    addsig(SIGPIPE, SIG_IGN);
+    bool stop_server = false;
+    bool terminate = false;
+
+    //posix方法（推荐)新建共享内存
+    shmfd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
+    assert(shmfd != -1);
+    ret = ftruncate(shmfd, USER_LIMIT * BUFFER_SIZE);
+    assert(ret != -1);
+    share_mem = (char*)mmap(NULL, USER_LIMIT * BUFFER_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shmfd, 0);
+    assert(share_mem != MAP_FAILED);
+    close(shmfd);
+
+    while (!stop_server)
+    {
+        int number = epoll_wait(epollfd, events, MAX_EVENT_NUMBER, -1);
+        //epoll出错的情况
+        if ((number < 0) && (errno != EINTR))
+        {
+            printf("epoll failure\n");
+            break;
+        }
+
+        for (int i = 0; i < number; i++)//不能用sign_t类型的i！否则number=-1的情况会出错的i！
+        {
+            int sockfd = events[i].data.fd;
+            //新来了个用户
+            if (sockfd == listenfd)
+            {
+                struct sockaddr_in client_address;
+                socklen_t client_addrlength = sizeof(client_address);
+                int connfd = accept(listenfd, (struct sockaddr*)&client_address, &client_addrlength);
+                if (connfd < 0)
+                {
+                    printf("errno is: %d\n", errno);
+                    continue;
+                }
+                if (user_count >= USER_LIMIT)
+                {
+                    const char* info = "too many users\n";
+                    printf("%s", info);
+                    send(connfd, info, strlen(info), 0);
+                    close(connfd);
+                    continue;
+                }
+                users[user_count].address = client_address;
+                users[user_count].connfd = connfd;
+                //创建主进程与子进程间通信的socketpair
+                ret = socketpair(PF_UNIX, SOCK_STREAM, 0, users[user_count].pipefd);
+                assert(ret != -1);
+                pid_t pid = fork();
+                if (pid < 0)
+                {
+                    //fork失败
+                    close(connfd);
+                    continue;
+                }
+                else if (pid == 0)
+                {
+                    //子进程执行内容
+                    close(epollfd);
+                    close(listenfd);
+                    close(users[user_count].pipefd[0]);
+                    close(sig_pipefd[0]);
+                    close(sig_pipefd[1]);
+                    run_child(user_count, users, share_mem);
+                    munmap((void*)share_mem, USER_LIMIT * BUFFER_SIZE);
+                    exit(0);
+                }
+                else
+                {
+                    //主进程执行内容
+                    close(connfd);
+                    close(users[user_count].pipefd[1]);
+                    addfd(epollfd, users[user_count].pipefd[0]);//监听新用户的信息
+                    users[user_count].pid = pid;
+                    sub_process[pid] = user_count;
+                    user_count++;
+                }
+            }
+            //有信号
+            else if ((sockfd == sig_pipefd[0]) && (events[i].events & EPOLLIN))
+            {
+                int sig;
+                char signals[1024];
+                ret = recv(sig_pipefd[0], signals, sizeof(signals), 0);
+                if (ret == -1)
+                {
+                    continue;
+                }
+                else if (ret == 0)
+                {
+                    continue;
+                }
+                else
+                {
+                    for (int i = 0; i < ret; ++i)
+                    {
+                        switch (signals[i])
+                        {
+                        case SIGCHLD:  //子进程状态发送变化（退出或暂停）
+                        {
+                            pid_t pid;
+                            int stat;
+                            while ((pid = waitpid(-1, &stat, WNOHANG)) > 0) //获取退出的进程id
+                            {
+                                int del_user = sub_process[pid]; //要删除的用户编号
+                                sub_process[pid] = -1;
+                                if ((del_user < 0) || (del_user > USER_LIMIT))
+                                {
+                                    printf("the deleted user was not change\n");
+                                    continue;
+                                }
+                                //替换用户del_user的资源
+                                epoll_ctl(epollfd, EPOLL_CTL_DEL, users[del_user].pipefd[0], 0);
+                                close(users[del_user].pipefd[0]);
+                                users[del_user] = users[--user_count];
+                                sub_process[users[del_user].pid] = del_user;
+                                printf("child %d exit, now we have %d users\n", del_user, user_count);
+                            }
+                            if (terminate && user_count == 0)
+                            {
+                                stop_server = true;
+                            }
+                            break;
+                        }
+                        case SIGTERM:
+                        case SIGINT:
+                        {
+                            printf("kill all the clild now\n");
+                            //addsig( SIGTERM, SIG_IGN );
+                            //addsig( SIGINT, SIG_IGN );
+                            if (user_count == 0)
+                            {
+                                stop_server = true;
+                                break;
+                            }
+                            for (int i = 0; i < user_count; ++i)
+                            {
+                                int pid = users[i].pid;
+                                kill(pid, SIGTERM);
+                            }
+                            terminate = true;
+                            break;
+                        }
+                        default:
+                        {
+                            break;
+                        }
+                        }
+                    }
+                }
+            }
+            //子进程（用户）发送了信息
+            else if (events[i].events & EPOLLIN)
+            {
+                int child = 0;
+                ret = recv(sockfd, (char*)&child, sizeof(child), 0);
+                printf("read data from child accross pipe\n");
+                if (ret == -1)
+                {
+                    continue;
+                }
+                else if (ret == 0)
+                {
+                    continue;
+                }
+                else
+                {
+                    for (int j = 0; j < user_count; ++j)
+                    {
+                        if (users[j].pipefd[0] != sockfd)
+                        {
+                            printf("send data to child accross pipe\n");
+                            send(users[j].pipefd[0], (char*)&child, sizeof(child), 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    del_resource();
+    return 0;
 }
